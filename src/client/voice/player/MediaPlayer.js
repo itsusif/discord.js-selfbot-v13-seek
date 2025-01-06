@@ -152,12 +152,10 @@ class MediaPlayer extends EventEmitter {
     this.videoDispatcher = null;
     this.voiceConnection = voiceConnection;
     this.isScreenSharing = isScreenSharing;
-    this.frameBuffer = null;
-    this.seekTransform = null;
     this.ffmpegProcess = null;
     this.streams = new Map();
-    this.volume = 1.0;
   }
+
   /**
    * Real-time seek implementation
    */
@@ -363,16 +361,7 @@ class MediaPlayer extends EventEmitter {
 
 
 
-  constructor(voiceConnection, isScreenSharing) {
-    super();
-    this.dispatcher = null;
-    this.videoDispatcher = null;
-    this.voiceConnection = voiceConnection;
-    this.isScreenSharing = isScreenSharing;
-    this.ffmpegProcess = null;
-    this.streams = new Map();
-  }
-
+ 
   destroyDispatcher() {
     if (this.dispatcher) {
       this.dispatcher.destroy();
