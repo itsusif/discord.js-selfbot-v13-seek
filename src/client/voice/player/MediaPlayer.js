@@ -9,16 +9,20 @@ const { H264Dispatcher } = require('../dispatcher/AnnexBDispatcher');
 const AudioDispatcher = require('../dispatcher/AudioDispatcher');
 const { VP8Dispatcher } = require('../dispatcher/VPxDispatcher');
 
-// FFMPEG configurations
+// FFMPEG configurations with optimized settings for Discord streaming
 const FFMPEG_OUTPUT_PREFIX = [
   '-use_wallclock_as_timestamps', '1',
   '-copyts',
   '-analyzeduration', '0',
-  '-vsync', 'drop',
-  '-async', '1'
+  '-probesize', '32768',  // Reduced probe size for faster startup
+  '-fflags', '+nobuffer+fastseek',  // Reduce buffering
+  '-vsync', 'cfr',  // Use constant frame rate
+  '-max_delay', '0',
+  '-copytb', '1'
 ];
 
 const FFMPEG_INPUT_PREFIX = [
+  '-re',  // Read input at native frame rate
   '-reconnect', '1',
   '-reconnect_at_eof', '1',
   '-reconnect_streamed', '1',
@@ -28,101 +32,70 @@ const FFMPEG_INPUT_PREFIX = [
 const FFMPEG_PCM_ARGUMENTS = ['-f', 's16le', '-ar', '48000', '-ac', '2'];
 
 const FFMPEG_VP8_ARGUMENTS = [
+  '-c:v', 'libvpx',
   '-f', 'ivf',
   '-deadline', 'realtime',
-  '-c:v', 'libvpx',
-  '-cpu-used', '5',
-  '-lag-in-frames', '0'
+  '-cpu-used', '4',
+  '-auto-alt-ref', '0',
+  '-lag-in-frames', '0',
+  '-bufsize', '1000k',
+  '-rc_lookahead', '0',
+  '-quality', 'realtime',
+  '-error-resilient', '1'
 ];
 
 const FFMPEG_H264_ARGUMENTS = options => [
   '-c:v', 'libx264',
-  '-f', 'h264',
+  '-preset', options?.presetH26x || 'ultrafast',
   '-tune', 'zerolatency',
-  '-preset', options?.presetH26x || 'faster',
   '-profile:v', 'baseline',
-  '-bf', '0',
+  '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+  '-minrate', `${options?.bitrate || 3000}k`,
+  '-maxrate', `${options?.bitrate || 3000}k`,
+  '-bufsize', '1000k',
   '-g', `${options?.fps || 30}`,
   '-keyint_min', `${options?.fps || 30}`,
-  '-bsf:v', 'h264_metadata=aud=insert'
+  '-pix_fmt', 'yuv420p',
+  '-f', 'h264'
 ];
 
-/**
- * Custom transform stream for handling media seeking
- */
-class SeekTransform extends Transform {
+class FrameBuffer extends Transform {
   constructor(options = {}) {
     super(options);
-    this.seekTime = 0;
-    this.seeking = false;
-    this.bytesSkipped = 0;
-    this.frameSize = options.frameSize || 960;
-    this.sampleRate = options.sampleRate || 48000;
-    this.bytesPerSample = options.bytesPerSample || 4;
-    this.bufferSize = options.bufferSize || 1024 * 1024; // 1MB buffer
-    this.buffer = Buffer.alloc(0);
-    this.keyframes = new Map();
+    this.frameQueue = [];
+    this.fps = options.fps || 30;
+    this.interval = 1000 / this.fps;
+    this.lastFrameTime = 0;
+    this.active = true;
   }
 
   _transform(chunk, encoding, callback) {
-    try {
-      if (this.seeking) {
-        // Calculate frames to skip
-        const framesToSkip = Math.floor((this.seekTime * this.sampleRate) / this.frameSize);
-        const bytesToSkip = framesToSkip * this.frameSize * this.bytesPerSample;
-        
-        this.bytesSkipped += chunk.length;
-        
-        if (this.bytesSkipped >= bytesToSkip) {
-          // We've skipped enough, start pushing data
-          const excess = this.bytesSkipped - bytesToSkip;
-          if (excess > 0) {
-            this.push(chunk.slice(chunk.length - excess));
-          }
-          this.seeking = false;
-        }
-      } else {
-        // Normal operation - buffer management
-        this.buffer = Buffer.concat([this.buffer, chunk]);
-        
-        while (this.buffer.length > this.frameSize * this.bytesPerSample) {
-          const frame = this.buffer.slice(0, this.frameSize * this.bytesPerSample);
-          this.push(frame);
-          this.buffer = this.buffer.slice(this.frameSize * this.bytesPerSample);
-        }
-      }
-      callback();
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  _flush(callback) {
-    if (this.buffer.length > 0) {
-      this.push(this.buffer);
-    }
+    this.frameQueue.push(chunk);
+    this._processQueue();
     callback();
   }
 
-  seek(time) {
-    this.seekTime = time;
-    this.seeking = true;
-    this.bytesSkipped = 0;
-    this.buffer = Buffer.alloc(0);
-  }
+  _processQueue() {
+    if (!this.active || this.frameQueue.length === 0) return;
 
-  addKeyframe(timestamp, position) {
-    this.keyframes.set(timestamp, position);
-  }
-
-  getClosestKeyframe(timestamp) {
-    let closest = 0;
-    for (const [time, position] of this.keyframes.entries()) {
-      if (time <= timestamp && time > closest) {
-        closest = time;
-      }
+    const now = Date.now();
+    if (now - this.lastFrameTime >= this.interval) {
+      const frame = this.frameQueue.shift();
+      this.push(frame);
+      this.lastFrameTime = now;
     }
-    return this.keyframes.get(closest);
+
+    // Schedule next frame
+    setTimeout(() => this._processQueue(), Math.max(0, this.interval - (Date.now() - this.lastFrameTime)));
+  }
+
+  start() {
+    this.active = true;
+    this._processQueue();
+  }
+
+  stop() {
+    this.active = false;
   }
 }
 
@@ -136,15 +109,10 @@ class MediaPlayer extends EventEmitter {
     this.videoDispatcher = null;
     this.voiceConnection = voiceConnection;
     this.isScreenSharing = isScreenSharing;
-    this.seekTransform = null;
-    this.ffmpegProcess = null;
-    this.currentTime = 0;
-    this.startTime = Date.now();
-    this.paused = false;
-    this.volume = 1.0;
+    this.frameBuffer = null;
     this.streams = new Map();
+    this.streamStartTime = 0;
   }
-
   /**
    * Real-time seek implementation
    */
@@ -414,23 +382,45 @@ class MediaPlayer extends EventEmitter {
   }
 
   /**
-   * Play video with seeking support
+   * Get accurate current playback time
    */
+  getCurrentTime() {
+    if (this.paused) {
+      return this.currentTime;
+    }
+    return this.currentTime + ((Date.now() - this.startTime) / 1000);
+  }
+
+  /**
+   * Create audio dispatcher
+   */
+  createDispatcher(options, streams) {
+    if (this.dispatcher) {
+      this.dispatcher.destroy();
+    }
+    const dispatcher = new AudioDispatcher(this, options, streams);
+    this.dispatcher = dispatcher;
+    return dispatcher;
+  }
+
+
   async playUnknownVideo(input, options = {}) {
+    this.destroyVideoDispatcher();
+
     const isStream = input instanceof ReadableStream;
     if (!options?.fps) options.fps = 30;
 
+    // Set minimum bitrate for stable streaming
+    if (!options.bitrate || options.bitrate < 3000) {
+      options.bitrate = 3000;
+    }
+
     const args = [
       ...FFMPEG_OUTPUT_PREFIX,
-      '-enable_seek', '1',
       '-i', isStream ? '-' : input,
-      '-flags', 'low_delay',
-      '-r', `${options?.fps}`
+      '-r', `${options.fps}`,
+      '-b:v', `${options.bitrate}k`
     ];
-
-    if (options?.bitrate) {
-      args.push('-b:v', `${options?.bitrate}K`);
-    }
 
     if (options?.hwAccel) {
       args.unshift('-hwaccel', 'auto');
@@ -453,96 +443,108 @@ class MediaPlayer extends EventEmitter {
       throw new Error('Invalid codec (Supported: VP8, H264)');
     }
 
+    // Create FFmpeg process
     const ffmpeg = new prism.FFmpeg({ args });
-    this.ffmpegProcess = ffmpeg.process;
-
     this.emit('debug', `[ffmpeg-video] Spawn process with args:\n${args.join(' ')}`);
 
     ffmpeg.process.stderr.on('data', data => {
       this.emit('debug', `[ffmpeg-video]: ${data.toString()}`);
     });
 
-    // Set up stream pipeline
+    // Set up input stream if needed
     if (isStream) {
       input.pipe(ffmpeg);
     }
 
+    // Create frame buffer for smooth playback
+    this.frameBuffer = new FrameBuffer({ fps: options.fps });
+
+    const streamOptions = {
+      ffmpeg,
+      highWaterMark: options?.highWaterMark || 32, // Increased for smoother playback
+      streams: {}
+    };
+
+    // Initialize dispatcher based on codec
     let dispatcher;
     if (this.voiceConnection.videoCodec === 'VP8') {
       const videoStream = new IvfTransformer();
       ffmpeg.pipe(videoStream);
-      dispatcher = new VP8Dispatcher(this, options?.highWaterMark, {
-        ffmpeg,
-        video: videoStream
-      }, options?.fps);
-      videoStream.pipe(dispatcher);
-    } else {
+      streamOptions.streams.video = videoStream;
+      
+      dispatcher = new VP8Dispatcher(
+        this,
+        options?.highWaterMark || 32,
+        streamOptions,
+        options.fps
+      );
+
+      // Connect streams through frame buffer
+      videoStream
+        .pipe(this.frameBuffer)
+        .pipe(dispatcher);
+
+    } else if (this.voiceConnection.videoCodec === 'H264') {
       const videoStream = new H264NalSplitter();
       ffmpeg.pipe(videoStream);
-      dispatcher = new H264Dispatcher(this, options?.highWaterMark, {
-        ffmpeg,
-        video: videoStream
-      }, options?.fps);
-      videoStream.pipe(dispatcher);
+      streamOptions.streams.video = videoStream;
+      
+      dispatcher = new H264Dispatcher(
+        this,
+        options?.highWaterMark || 32,
+        streamOptions,
+        options.fps
+      );
+
+      // Connect streams through frame buffer
+      videoStream
+        .pipe(this.frameBuffer)
+        .pipe(dispatcher);
     }
 
+    // Set up dispatcher event handling
+    dispatcher.on('start', () => {
+      this.streamStartTime = Date.now();
+      this.frameBuffer.start();
+      this.emit('streamStart');
+    });
+
+    dispatcher.on('end', () => {
+      this.frameBuffer.stop();
+      this.emit('streamEnd');
+    });
+
+    dispatcher.on('error', error => {
+      this.emit('error', error);
+    });
+
     this.videoDispatcher = dispatcher;
-    this.currentTime = options.seek || 0;
-    this.startTime = Date.now() - (this.currentTime * 1000);
+
+    // Start frame delivery after a short delay to ensure proper initialization
+    setTimeout(() => {
+      if (this.frameBuffer) {
+        this.frameBuffer.start();
+      }
+    }, 500);
 
     return dispatcher;
   }
 
-  /**
-   * Get accurate current playback time
-   */
-  getCurrentTime() {
-    if (this.paused) {
-      return this.currentTime;
-    }
-    return this.currentTime + ((Date.now() - this.startTime) / 1000);
-  }
-
-  /**
-   * Clean up resources
-   */
   destroy() {
-    if (this.ffmpegProcess) {
-      this.ffmpegProcess.kill();
-      this.ffmpegProcess = null;
-    }
-
-    if (this.seekTransform) {
-      this.seekTransform.destroy();
-      this.seekTransform = null;
-    }
-
-    for (const stream of this.streams.values()) {
-      stream.destroy();
-    }
-    this.streams.clear();
-
-    if (this.dispatcher) {
-      this.dispatcher.destroy();
-      this.dispatcher = null;
+    if (this.frameBuffer) {
+      this.frameBuffer.stop();
+      this.frameBuffer = null;
     }
 
     if (this.videoDispatcher) {
       this.videoDispatcher.destroy();
       this.videoDispatcher = null;
     }
-  }
 
-  /**
-   * Create audio dispatcher
-   */
-  createDispatcher(options, streams) {
-    if (this.dispatcher) {
-      this.dispatcher.destroy();
+    for (const stream of this.streams.values()) {
+      stream.destroy();
     }
-    const dispatcher = new AudioDispatcher(this, options, streams);
-    this.dispatcher = dispatcher;
-    return dispatcher;
+    this.streams.clear();
   }
 }
 
