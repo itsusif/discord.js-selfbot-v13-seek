@@ -102,6 +102,76 @@ class MediaPlayer extends EventEmitter {
     }
   }
 
+
+  /**
+   * Seeks to a specific time in the current media stream
+   * @param {number} time The time to seek to in seconds
+   * @param {Object} options Additional options for seeking
+   * @returns {Promise<boolean>} Returns true if seek was successful
+   */
+  async seek(time, options = {}) {
+    if (typeof time !== 'number' || time < 0) {
+      throw new Error('Seek time must be a non-negative number');
+    }
+
+    try {
+      // Store current stream states
+      const currentAudioOptions = this.dispatcher?.options || {};
+      const currentVideoOptions = this.videoDispatcher?.options || {};
+      const currentInput = this.dispatcher?.streams?.input || this.videoDispatcher?.streams?.input;
+
+      if (!currentInput) {
+        throw new Error('No active media stream to seek');
+      }
+
+      // Combine current options with seek time
+      const newOptions = {
+        ...currentAudioOptions,
+        ...options,
+        seek: time
+      };
+
+      // Destroy current dispatchers
+      this.destroyDispatcher();
+      this.destroyVideoDispatcher();
+
+      if (this.isScreenSharing) {
+        // Handle video seeking
+        const videoDispatcher = this.playUnknownVideo(currentInput, {
+          ...currentVideoOptions,
+          ...newOptions
+        });
+
+        return new Promise((resolve, reject) => {
+          videoDispatcher.once('start', () => resolve(true));
+          videoDispatcher.once('error', reject);
+        });
+      } else {
+        // Handle audio seeking
+        const audioDispatcher = this.playUnknown(currentInput, newOptions);
+
+        return new Promise((resolve, reject) => {
+          audioDispatcher.once('start', () => resolve(true));
+          audioDispatcher.once('error', reject);
+        });
+      }
+    } catch (error) {
+      this.emit('error', error);
+      return false;
+    }
+  }
+
+  // This helper method can be added to get current playback time
+  getCurrentTime() {
+    if (this.dispatcher) {
+      return this.dispatcher.totalStreamTime / 1000; // Convert to seconds
+    }
+    if (this.videoDispatcher) {
+      return this.videoDispatcher.totalStreamTime / 1000; // Convert to seconds
+    }
+    return 0;
+  }
+
   playUnknown(input, options, streams = {}) {
     this.destroyDispatcher();
     const isStream = input instanceof ReadableStream;
