@@ -266,6 +266,72 @@ class MediaPlayer extends EventEmitter {
   /**
    * Play unknown format media
    */
+  /**
+   * Play PCM format stream
+   */
+  playPCMStream(stream, options = {}, streams = {}) {
+    if (options?.volume === false) {
+      const opus = new prism.opus.Encoder({ channels: 2, rate: 48000, frameSize: 960 });
+      streams.opus = opus;
+      stream.pipe(opus);
+      return this.playOpusStream(opus, options, streams);
+    }
+
+    const volume = new prism.VolumeTransformer({ 
+      type: 's16le', 
+      volume: options?.volume || this.volume 
+    });
+    streams.volume = volume;
+    
+    const opus = new prism.opus.Encoder({ 
+      channels: 2, 
+      rate: 48000, 
+      frameSize: 960 
+    });
+    streams.opus = opus;
+
+    stream
+      .pipe(volume)
+      .pipe(opus);
+
+    return this.playOpusStream(opus, options, streams);
+  }
+
+  /**
+   * Play Opus format stream
+   */
+  playOpusStream(stream, options = {}, streams = {}) {
+    streams.opus = stream;
+
+    if (options?.volume !== false && !streams.input) {
+      streams.input = stream;
+      const decoder = new prism.opus.Decoder({ 
+        channels: 2, 
+        rate: 48000, 
+        frameSize: 960 
+      });
+
+      const volume = new prism.VolumeTransformer({ 
+        type: 's16le', 
+        volume: options?.volume || this.volume 
+      });
+      streams.volume = volume;
+
+      streams.opus = stream
+        .pipe(decoder)
+        .pipe(volume)
+        .pipe(new prism.opus.Encoder({ 
+          channels: 2, 
+          rate: 48000, 
+          frameSize: 960 
+        }));
+    }
+
+    const dispatcher = this.createDispatcher(options, streams);
+    streams.opus.pipe(dispatcher);
+    return dispatcher;
+  }
+
   async playUnknown(input, options = {}) {
     const isStream = input instanceof ReadableStream;
     const args = [
